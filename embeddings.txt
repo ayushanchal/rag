@@ -1,0 +1,1 @@
+model_name='sentence-transformers/all-MiniLM-L6-v2' cache_folder=None model_kwargs={} encode_kwargs={} query_encode_kwargs={} multi_process=False show_progress=False
