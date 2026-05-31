@@ -8,11 +8,21 @@ from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document
 from langchain_community.llms import HuggingFacePipeline
-from transformers import pipeline
+from transformers import (
+    AutoTokenizer,
+    AutoModelForCausalLM,
+    pipeline,
+    BitsAndBytesConfig
+)
 from huggingface_hub import login, whoami
 from dotenv import load_dotenv
 import re
-#import ollama
+from sentence_transformers import CrossEncoder
+from langchain_classic.retrievers import ContextualCompressionRetriever
+from langchain_classic.retrievers.document_compressors import CrossEncoderReranker
+from langchain_community.cross_encoders import HuggingFaceCrossEncoder
+import torch
+
 
 load_dotenv()
 hf_token = os.getenv("HF_TOKEN")
@@ -154,8 +164,12 @@ def load_split(pdf_path: str):
 
 def create_embeddings():
     return HuggingFaceEmbeddings(
-        model_name="sentence-transformers/all-MiniLM-L6-v2"
+        model_name="sentence-transformers/all-MiniLM-L6-v2",
+        model_kwargs={
+            "device": "cuda"
+        }
     )
+
 
 def create_vectorstore(chunks, embeddings):
     # Convert string chunks to Document objects
@@ -163,26 +177,73 @@ def create_vectorstore(chunks, embeddings):
     vectorstore = FAISS.from_documents(documents, embeddings)
     return vectorstore
 
+
 def load_llm():
+
+    model_name = "Qwen/Qwen3-4B"  # For RTX 3050 Ti 4GB
+
+    bnb_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_compute_dtype=torch.float16,
+        bnb_4bit_quant_type="nf4"
+    )
+
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        quantization_config=bnb_config,
+        device_map="auto"
+    )
+
     pipe = pipeline(
         "text-generation",
-        #model="google/flan-t5-base",
-        model="Qwen/Qwen3.5-0.8B",
+        model=model,
+        tokenizer=tokenizer,
         max_new_tokens=256,
         temperature=0.3
     )
+
     return HuggingFacePipeline(pipeline=pipe)
 
+
 def create_qa_chain(vectorstore, llm):
-    retriever = vectorstore.as_retriever(
-        search_kwargs={"k": 3}
+    # Step 1: Retrieve more documents using MMR
+    base_retriever = vectorstore.as_retriever(
+        search_type="mmr",
+        search_kwargs={
+            "k": 20,
+            "fetch_k": 50
+        }
     )
 
+    # Step 2: Load reranker
+    model = HuggingFaceCrossEncoder(
+        model_name="BAAI/bge-reranker-base",
+        model_kwargs={
+            "device": "cuda"
+            }
+    )
+
+    # Step 3: Keep only the best 5 chunks
+    compressor = CrossEncoderReranker(
+        model=model,
+        top_n=5
+    )
+
+    # Step 4: Wrap retriever with reranker
+    retriever = ContextualCompressionRetriever(
+        base_compressor=compressor,
+        base_retriever=base_retriever
+    )
+
+    # Step 5: Create QA chain
     qa = RetrievalQA.from_chain_type(
         llm=llm,
         retriever=retriever,
         return_source_documents=False
     )
+
     return qa
 
 if __name__ == "__main__":
@@ -204,20 +265,10 @@ if __name__ == "__main__":
     print("Creating embeddings...")
     embeddings = create_embeddings()
     
-    #print(str(embeddings))
-    #with open("embeddings.txt", "w") as file1:
-    #   file1.write(str(embeddings))
-    #print("embeddings created")
 
     print("Creating vector store...")
     vectorstore = create_vectorstore(chunks, embeddings)
     
-
-
-    #with open("vectorstore.txt", "w") as file2:
-    #    file2.write(vectorstore)
-    #print("vectorstore   created")
-
     print("Loading LLM...")
     llm = load_llm()
 
@@ -233,7 +284,8 @@ if __name__ == "__main__":
 
         result = qa_chain.invoke({"query": query})
 
-        print("\nAnswer:\n", result)
+        print("\nAnswer:\n", result['result'])
+
         '''print("\nSources:")
         for doc in result["source_documents"]:
             print("-", doc.metadata.get("source"))'''
